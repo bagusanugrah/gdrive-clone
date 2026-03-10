@@ -5,14 +5,13 @@ const multer = require('multer');
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const mysql = require('mysql2/promise');
 const { v4: uuidv4 } = require('uuid');
-const { OAuth2Client } = require('google-auth-library');
 const jwt = require('jsonwebtoken');
+const bcrypt = require('bcrypt');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 const JWT_SECRET = process.env.JWT_SECRET || 'rahasia_super_aman';
 
 const s3 = new S3Client({
@@ -33,7 +32,7 @@ const pool = mysql.createPool({
   queueLimit: 0
 });
 
-// Fungsi untuk membuat tabel otomatis jika belum ada
+// Inisialisasi Database dengan skema baru (menggunakan password)
 const initializeDatabase = async () => {
   try {
     const connection = await pool.getConnection();
@@ -41,9 +40,9 @@ const initializeDatabase = async () => {
     await connection.query(`
       CREATE TABLE IF NOT EXISTS users (
         id INT AUTO_INCREMENT PRIMARY KEY,
-        google_id VARCHAR(255) UNIQUE NOT NULL,
         email VARCHAR(255) UNIQUE NOT NULL,
-        name VARCHAR(255)
+        password VARCHAR(255) NOT NULL,
+        name VARCHAR(255) NOT NULL
       )
     `);
 
@@ -81,32 +80,46 @@ const verifyToken = (req, res, next) => {
   });
 };
 
-app.post('/api/auth/google', async (req, res) => {
-  const { token } = req.body;
+// Endpoint: Register Klasik
+app.post('/api/auth/register', async (req, res) => {
+  const { name, email, password } = req.body;
+  if (!name || !email || !password) return res.status(400).send('Semua data wajib diisi.');
+
   try {
-    const ticket = await googleClient.verifyIdToken({
-      idToken: token,
-      audience: process.env.GOOGLE_CLIENT_ID,
-    });
-    const { sub: googleId, email, name } = ticket.getPayload();
+    const [existingUsers] = await pool.query('SELECT * FROM users WHERE email = ?', [email]);
+    if (existingUsers.length > 0) return res.status(400).send('Email sudah terdaftar.');
 
-    const [rows] = await pool.query('SELECT * FROM users WHERE google_id = ?', [googleId]);
-    let userId;
+    const hashedPassword = await bcrypt.hash(password, 10);
+    await pool.query(
+      'INSERT INTO users (name, email, password) VALUES (?, ?, ?)',
+      [name, email, hashedPassword]
+    );
 
-    if (rows.length === 0) {
-      const [result] = await pool.query(
-        'INSERT INTO users (google_id, email, name) VALUES (?, ?, ?)',
-        [googleId, email, name]
-      );
-      userId = result.insertId;
-    } else {
-      userId = rows[0].id;
-    }
-
-    const customJwt = jwt.sign({ id: userId, email }, JWT_SECRET, { expiresIn: '1d' });
-    res.status(200).json({ token: customJwt, user: { id: userId, email, name } });
+    res.status(201).send('Registrasi berhasil. Silakan login.');
   } catch (error) {
-    res.status(401).send('Verifikasi Google gagal.');
+    console.error(error);
+    res.status(500).send('Terjadi kesalahan pada server.');
+  }
+});
+
+// Endpoint: Login Klasik
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).send('Email dan password wajib diisi.');
+
+  try {
+    const [users] = await pool.query('SELECT * FROM users WHERE email = ?', [email]);
+    if (users.length === 0) return res.status(401).send('Email atau password salah.');
+
+    const user = users[0];
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+    if (!isPasswordValid) return res.status(401).send('Email atau password salah.');
+
+    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '1d' });
+    res.status(200).json({ token, user: { id: user.id, email: user.email, name: user.name } });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send('Terjadi kesalahan pada server.');
   }
 });
 
@@ -166,7 +179,6 @@ app.delete('/api/files/:id', verifyToken, async (req, res) => {
   }
 });
 
-// Jalankan inisialisasi database sebelum server mulai berjalan
 initializeDatabase().then(() => {
   app.listen(5000, () => console.log('Backend berjalan di port 5000'));
 });
