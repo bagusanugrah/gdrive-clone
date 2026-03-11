@@ -7,6 +7,8 @@ const mysql = require('mysql2/promise');
 const { v4: uuidv4 } = require('uuid');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
+const { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const app = express();
 app.use(cors());
@@ -126,8 +128,21 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/files', verifyToken, async (req, res) => {
   try {
     const [rows] = await pool.query('SELECT * FROM files WHERE user_id = ? ORDER BY upload_date DESC', [req.user.id]);
-    res.status(200).json(rows);
+    
+    // Looping untuk membuat Presigned URL (Tiket VIP 1 Jam) untuk setiap file
+    const filesWithPresignedUrls = await Promise.all(rows.map(async (file) => {
+      const command = new GetObjectCommand({
+        Bucket: process.env.S3_BUCKET_NAME,
+        Key: file.s3_key,
+      });
+      const signedUrl = await getSignedUrl(s3, command, { expiresIn: 3600 }); // Valid 3600 detik (1 jam)
+      
+      return { ...file, file_url: signedUrl }; // Timpa URL mentah dengan URL VIP
+    }));
+
+    res.status(200).json(filesWithPresignedUrls);
   } catch (error) {
+    console.error('Error saat fetch file:', error);
     res.status(500).send('Gagal mengambil daftar file.');
   }
 });
@@ -153,6 +168,14 @@ app.post('/api/upload', verifyToken, upload.single('file'), async (req, res) => 
     );
 
     const [newFile] = await pool.query('SELECT * FROM files WHERE id = ?', [result.insertId]);
+    
+    // Buat tiket VIP langsung untuk file yang baru di-upload ini
+    const getCommand = new GetObjectCommand({
+      Bucket: process.env.S3_BUCKET_NAME,
+      Key: fileKey,
+    });
+    newFile[0].file_url = await getSignedUrl(s3, getCommand, { expiresIn: 3600 });
+
     res.status(200).json(newFile[0]);
   } catch (error) {
     res.status(500).send('Gagal mengunggah file.');
